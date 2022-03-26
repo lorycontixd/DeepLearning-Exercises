@@ -1,2 +1,3 @@
-# DeepLearning-Exercises
-Collection of exercises for the Deep Learning course in the Master Program for the university of Milan.
+# Deep Learning 2022
+
+Deadline 31/02/2023.
