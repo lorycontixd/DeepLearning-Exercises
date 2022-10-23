@@ -1,46 +1,62 @@
 import numpy as np
-import keras.backend.tensorflow_backend as backend
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Conv2D, MaxPooling2D, Activation, Flatten
-from keras.optimizers import Adam
-from keras.callbacks import TensorBoard
+import os
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
+#mixed_precision.set_global_policy('mixed_float16')
+tf.get_logger().setLevel(0)
+tf.autograph.set_verbosity(0)
+import tensorflow.compat.v1.keras.backend as backend
+from tensorflow.compat.v1 import Session, ConfigProto
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Conv2D, MaxPooling2D, Activation, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import TensorBoard
+from tensorflow.compat.v1 import GPUOptions
 from collections import deque
+import datetime
 import time
 import random
 from tqdm import tqdm
-import os
 from PIL import Image
 import cv2
 
-
 DISCOUNT = 0.99
-REPLAY_MEMORY_SIZE = 50_000  # How many last steps to keep for model training
-MIN_REPLAY_MEMORY_SIZE = 1_000  # Minimum number of steps in a memory to start training
-MINIBATCH_SIZE = 64  # How many steps (samples) to use for training
-UPDATE_TARGET_EVERY = 5  # Terminal states (end of episodes)
+REPLAY_MEMORY_SIZE = 50000  # How many last steps to keep for model training (default=50_000)
+MIN_REPLAY_MEMORY_SIZE = 100  # Minimum number of steps in a memory to start training (default=1_000)
+MINIBATCH_SIZE = 8  # How many steps (samples) to use for training (default=32, pref multiple of 8)
+UPDATE_TARGET_EVERY = 4  # Terminal states (end of episodes) (default=20)
 MODEL_NAME = '2x256'
 MIN_REWARD = -200  # For model save
 MEMORY_FRACTION = 0.20
 
+
 # Environment settings
-EPISODES = 20_000
+EPISODES = 16 # (default=20_000)
 
 # Exploration settings
-epsilon = 1  # not a constant, going to be decayed
+epsilon = 0.99
 EPSILON_DECAY = 0.99975
 MIN_EPSILON = 0.001
 
 #  Stats settings
-AGGREGATE_STATS_EVERY = 50  # episodes
-SHOW_PREVIEW = False
+EPISODE_LIMIT_WARNING = 5000
+AGGREGATE_STATS_EVERY = 5 # episodes -> default=50
+SHOW_PREVIEW = True
 
 
 class Blob:
-    def __init__(self, size):
+    def __init__(self, size, pos: tuple = None):
         self.size = size
-        self.x = np.random.randint(0, size)
-        self.y = np.random.randint(0, size)
+        if pos is None:
+            self.x = np.random.randint(0, size)
+            self.y = np.random.randint(0, size)
+        else:
+            assert isinstance(pos, tuple), "Blob position must be a tuple"
+            assert len(pos)==2, f"Blob position must have 2 elements, not {len(tuple)}"
+            assert isinstance(pos[0], int) and isinstance(pos[1], int), "Blob position must be integers"
+            assert pos[0] < size and pos[1] < size, "Blob position outside environment space"
+            self.x = pos[0]
+            self.y = pos[1]
 
     def __str__(self):
         return f"Blob ({self.x}, {self.y})"
@@ -110,6 +126,7 @@ class BlobEnv:
     FOOD_REWARD = 25
     OBSERVATION_SPACE_VALUES = (SIZE, SIZE, 3)  # 4
     ACTION_SPACE_SIZE = 9
+    
     PLAYER_N = 1  # player key in dict
     FOOD_N = 2  # food key in dict
     ENEMY_N = 3  # enemy key in dict
@@ -134,7 +151,7 @@ class BlobEnv:
         else:
             observation = (self.player-self.food) + (self.player-self.enemy)
         return observation
-
+    
     def step(self, action):
         self.episode_step += 1
         self.player.action(action)
@@ -184,11 +201,21 @@ class ModifiedTensorBoard(TensorBoard):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.step = 1
-        self.writer = tf.summary.FileWriter(self.log_dir)
+        self.writer = tf.summary.create_file_writer(self.log_dir)
+        self._log_write_dir = self.log_dir
 
     # Overriding this method to stop creating default log writer
     def set_model(self, model):
-        pass
+        self.model = model
+
+        self._train_dir = os.path.join(self._log_write_dir, 'train')
+        self._train_step = self.model._train_counter
+
+        self._val_dir = os.path.join(self._log_write_dir, 'validation')
+        self._val_step = self.model._test_counter
+
+        self._should_write_train_graph = False
+
 
     # Overrided, saves logs with our step number
     # (otherwise every .fit() will start writing from 0th step)
@@ -208,12 +235,18 @@ class ModifiedTensorBoard(TensorBoard):
     # Creates writer, writes custom metrics and closes writer
     def update_stats(self, **stats):
         self._write_logs(stats, self.step)
-
-
+        
+    def _write_logs(self, logs, index):
+        with self.writer.as_default():
+            for name, value in logs.items():
+                tf.summary.scalar(name, value, step=index)
+                self.step += 1
+                self.writer.flush()
+                
 # Agent class
 class DQNAgent:
-    def __init__(self):
-
+    def __init__(self, env):
+        self.env = env
         # Main model
         self.model = self.create_model()
 
@@ -233,7 +266,7 @@ class DQNAgent:
     def create_model(self):
         model = Sequential()
 
-        model.add(Conv2D(256, (3, 3), input_shape=env.OBSERVATION_SPACE_VALUES))  # OBSERVATION_SPACE_VALUES = (10, 10, 3) a 10x10 RGB image.
+        model.add(Conv2D(256, (3, 3), input_shape=self.env.OBSERVATION_SPACE_VALUES))  # OBSERVATION_SPACE_VALUES = (10, 10, 3) a 10x10 RGB image.
         model.add(Activation('relu'))
         model.add(MaxPooling2D(pool_size=(2, 2)))
         model.add(Dropout(0.2))
@@ -246,8 +279,8 @@ class DQNAgent:
         model.add(Flatten())  # this converts our 3D feature maps to 1D feature vectors
         model.add(Dense(64))
 
-        model.add(Dense(env.ACTION_SPACE_SIZE, activation='linear'))  # ACTION_SPACE_SIZE = how many choices (9)
-        model.compile(loss="mse", optimizer=Adam(lr=0.001), metrics=['accuracy'])
+        model.add(Dense(self.env.ACTION_SPACE_SIZE, activation='linear'))  # ACTION_SPACE_SIZE = how many choices (9)
+        model.compile(loss="mse", optimizer=Adam(learning_rate=0.001), metrics=['accuracy'])
         return model
 
     # Adds step's data to a memory replay array
@@ -315,6 +348,9 @@ class DQNAgent:
 
 
 
+## Train
+
+start = time.time()
 env = BlobEnv()
 
 # For stats
@@ -323,19 +359,22 @@ ep_rewards = [-200]
 # For more repetitive results
 random.seed(1)
 np.random.seed(1)
-tf.set_random_seed(1)
+tf.random.set_seed(1)
 
-# Memory fraction, used mostly when trai8ning multiple agents
-#gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
-#backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
+# Memory fraction, used mostly when training multiple agents
+#gpu_options = GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
+#backend.set_session(Session(config=ConfigProto(gpu_options=gpu_options)))
 
 # Create models folder
 if not os.path.isdir('models'):
     os.makedirs('models')
-agent = DQNAgent()
+agent = DQNAgent(env)
+
 
 # iterate over episodes
-for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
+#for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
+for episode in range(1, EPISODES + 1):
+    print(f"Starting episode {episode}/{EPISODES+1}", end='\r', flush = True)
     # Update tensorboard step every episode
     agent.tensorboard.step = episode
 
@@ -345,11 +384,11 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
 
     # Reset environment and get initial state
     current_state = env.reset()
-    
+    warning_printed = False
+
     # Reset flag and start iterating until episode ends
     done = False
     while not done:
-
         # This part stays mostly the same, the change is to query a model for Q values
         if np.random.random() > epsilon:
             # Get action from Q table
@@ -359,7 +398,7 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
             action = np.random.randint(0, env.ACTION_SPACE_SIZE)
 
         new_state, reward, done = env.step(action)
-        
+
         # Transform new continous state to new discrete state and count reward
         episode_reward += reward
 
@@ -370,22 +409,30 @@ for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
         agent.update_replay_memory((current_state, action, reward, new_state, done))
         agent.train(done, step)
         current_state = new_state
+        if step > EPISODE_LIMIT_WARNING and not warning_printed:
+            print(f"Warning: episode step exceeded limit {EPISODE_LIMIT_WARNING}")
+            warning_printed = True
         step += 1
-        
-        ### Stats
-        # Append episode reward to a list and log stats (every given number of episodes)
-        ep_rewards.append(episode_reward)
-        if not episode % AGGREGATE_STATS_EVERY or episode == 1:
-            average_reward = sum(ep_rewards[-AGGREGATE_STATS_EVERY:])/len(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            min_reward = min(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            max_reward = max(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            agent.tensorboard.update_stats(reward_avg=average_reward, reward_min=min_reward, reward_max=max_reward, epsilon=epsilon)
 
-            # Save model, but only when min reward is greater or equal a set value
-            if average_reward >= MIN_REWARD:
-                agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+    ### Stats
+    # Append episode reward to a list and log stats (every given number of episodes)
+    ep_rewards.append(episode_reward)
+    if not episode % AGGREGATE_STATS_EVERY or episode == 1:
+        average_reward = sum(ep_rewards[-AGGREGATE_STATS_EVERY:])/len(ep_rewards[-AGGREGATE_STATS_EVERY:])
+        min_reward = min(ep_rewards[-AGGREGATE_STATS_EVERY:])
+        max_reward = max(ep_rewards[-AGGREGATE_STATS_EVERY:])
+        agent.tensorboard.update_stats(reward_avg=average_reward, reward_min=min_reward, reward_max=max_reward, epsilon=epsilon, steps=step)
+
+        # Save model, but only when min reward is greater or equal a set value
+        if average_reward >= MIN_REWARD:
+            agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+
+    # Decay epsilon
+    if epsilon > MIN_EPSILON:
+        epsilon *= EPSILON_DECAY
+        epsilon = max(MIN_EPSILON, epsilon)
         
-        # Decay epsilon
-        if epsilon > MIN_EPSILON:
-            epsilon *= EPSILON_DECAY
-            epsilon = max(MIN_EPSILON, epsilon)
+end = time.time()
+elapsed = end - start
+elapsed_str = str(datetime.timedelta(seconds=elapsed))
+print("Training complete in ",elapsed_str)
