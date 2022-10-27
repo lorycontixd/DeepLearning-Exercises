@@ -35,7 +35,6 @@ MODEL_NAME = '2x256'
 MIN_REWARD = -200  # For model save
 MEMORY_FRACTION = 0.20
 
-
 # Environment settings
 EPISODES = 1500 # (default=20_000)
 
